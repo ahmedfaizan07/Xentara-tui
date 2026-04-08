@@ -387,36 +387,6 @@ rm -rf ~/.config/xentara-tui
 
 ---
 
-## Publishing to GitHub
-
-To make this available for others to install:
-
-```bash
-# Initialize a git repo
-cd /path/to/xentara-tui
-git init
-git add xentara-tui.php install.sh README.md
-git commit -m "Initial release: Xentara TUI client"
-
-# Create repo on GitHub (using gh CLI)
-gh repo create xentara-tui --public --source=. --push
-
-# Or manually: create repo on github.com, then:
-git remote add origin git@github.com:YOUR_USERNAME/xentara-tui.git
-git branch -M main
-git push -u origin main
-```
-
-Then anyone can install with:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/xentara-tui.git
-cd xentara-tui
-./install.sh
-```
-
----
-
 ## File Structure
 
 ```
