@@ -89,7 +89,7 @@ sudo pacman -S php
 ### Option 1: One-Line Install from GitHub
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/xentara-tui.git
+git clone https://github.com/ahmedfaizan07/xentara-tui.git
 cd xentara-tui
 ./install.sh
 ```
@@ -103,7 +103,7 @@ xentara-tui
 ### Option 2: Run Directly (No Install)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/xentara-tui.git
+git clone https://github.com/ahmedfaizan07/xentara-tui.git
 cd xentara-tui
 php xentara-tui.php
 ```
@@ -111,10 +111,9 @@ php xentara-tui.php
 ### Option 3: curl One-Liner
 
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/xentara-tui/main/install.sh | bash
+curl -sL https://raw.githubusercontent.com/ahmedfaizan07/xentara-tui/main/install.sh | bash
 ```
 
-> **Note**: Replace `YOUR_USERNAME` with your actual GitHub username after creating the repository.
 
 ---
 
@@ -451,4 +450,4 @@ xentara-tui/
 
 ## License
 
-MIT License. See source file header for details.
+GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007. See source file header for details.
