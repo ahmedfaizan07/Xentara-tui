@@ -859,7 +859,12 @@ class XentaraWsClient
         if (!$this->socket) return [];
         stream_set_blocking($this->socket, false);
         $chunk = @fread($this->socket, 65536); // read up to 64KB at once
-        if ($chunk !== false && $chunk !== '') $this->recvBuf .= $chunk;
+        if ($chunk !== false && $chunk !== '') {
+            $this->recvBuf .= $chunk;
+        } elseif ($this->socket && feof($this->socket)) {
+            // Remote end closed the connection (Xentara stopped)
+            throw new \RuntimeException('Connection closed by remote host');
+        }
 
         $responses = [];
         while (($frame = $this->parseOneFrame()) !== null) {
@@ -1083,6 +1088,28 @@ class XentaraApi
     {
         $this->ws->unsubscribe($subscriptionUuid);
     }
+
+    /**
+     * Write a value to an element attribute (Opcode 5).
+     * Params: {0: elementUUID, 1: attributeId, 2: value}
+     * Response: [1, msgId] on success (no body)
+     * Errors: -32103 Read Only, -32106 Type Mismatch, -32105 Value Out Of Range, etc.
+     */
+    public function write(string $elementUuid, int $attrId, mixed $value): void
+    {
+        $params = [
+            0 => cborUuid($elementUuid),
+            1 => $attrId,
+            2 => $value,
+        ];
+        $resp = $this->ws->request(5, $params);
+        if (is_array($resp) && ($resp[0] ?? -1) === 2) {
+            $err = $resp[2] ?? [];
+            $code = is_array($err) ? ($err[0] ?? 0) : 0;
+            $msg  = is_array($err) ? ($err[1] ?? 'unknown') : 'unknown';
+            throw new \RuntimeException("Write error ({$code}): {$msg}");
+        }
+    }
 }
 
 // ─── TUI helpers ─────────────────────────────────────────────────────────────
@@ -1204,8 +1231,12 @@ function formatValue(mixed $v): string
     if ($v === false)             return 'false';
     if ($v instanceof CborBytes)  return '0x' . strtoupper(bin2hex($v->data));
     if ($v instanceof CborTag && $v->tag === 37) return bytesToUuid($v->value->data);
+    if ($v instanceof CborTag && $v->tag === 121) return formatValue($v->value);
+    if ($v instanceof CborTag && $v->tag === 122) return '(error)';
+    if ($v instanceof CborTag) return formatValue($v->value);
     if (is_array($v))             return '{array[' . count($v) . ']}';
     if (is_float($v))             return number_format($v, 6);
+    if (is_object($v))            return '{' . get_class($v) . '}';
     return (string)$v;
 }
 
@@ -1378,10 +1409,23 @@ class App
     private int $cols = 80;
     private int $rows = 24;
 
-    public function __construct(XentaraApi $api, XentaraWsClient $ws)
+    /** Whether the WebSocket connection is currently lost */
+    private bool $disconnected = false;
+
+    /** Stored connection credentials for reconnect */
+    private string $connHost;
+    private int    $connPort;
+    private string $connUser;
+    private string $connPass;
+
+    public function __construct(XentaraApi $api, XentaraWsClient $ws, string $host, int $port, string $user, string $pass)
     {
         $this->api = $api;
         $this->ws  = $ws;
+        $this->connHost = $host;
+        $this->connPort = $port;
+        $this->connUser = $user;
+        $this->connPass = $pass;
     }
 
     /**
@@ -1418,6 +1462,18 @@ class App
         try {
             $this->draw();
             while (true) {
+                // If disconnected, show overlay and wait for 'c' to reconnect or 'q' to quit
+                if ($this->disconnected) {
+                    $this->drawDisconnectedOverlay();
+                    $key = $this->readKeyDisconnected();
+                    if ($key === 'q') break;
+                    if ($key === 'c') {
+                        $this->reconnect();
+                        $this->draw();
+                    }
+                    continue;
+                }
+
                 $key = $this->readKey();
                 // Process any incoming subscription events
                 if ($this->processEvents()) {
@@ -1457,6 +1513,7 @@ class App
             }
             return $items;
         } catch (\Throwable $e) {
+            if ($this->detectDisconnect($e)) return [];
             $this->setStatus('Browse error: ' . $e->getMessage());
             return [];
         }
@@ -1482,6 +1539,7 @@ class App
             $this->detail = $raw;
         } catch (\Throwable $e) {
             $this->detail = [];
+            if ($this->detectDisconnect($e)) return;
         }
 
         // Subscribe to live attributes: 9=quality, 11=value
@@ -1490,6 +1548,7 @@ class App
             $this->subscriptionId = $subId;
             $this->setStatus("Subscribed to live updates: {$subId}");
         } catch (\Throwable $e) {
+            if ($this->detectDisconnect($e)) return;
             $this->setStatus('Subscribe error: ' . $e->getMessage());
         }
     }
@@ -1547,6 +1606,26 @@ class App
             }
         }
         return $updated;
+    }
+
+    /**
+     * Check if an exception indicates a lost WebSocket connection.
+     * If so, enter the disconnected state and return true.
+     */
+    private function detectDisconnect(\Throwable $e): bool
+    {
+        $msg = strtolower($e->getMessage());
+        if (str_contains($msg, 'connection lost')
+            || str_contains($msg, 'connection closed')
+            || str_contains($msg, 'server closed')
+            || str_contains($msg, 'broken pipe')
+            || str_contains($msg, 'write failed')) {
+            $this->disconnected = true;
+            $this->subscriptionId = '';
+            $this->setStatus('Disconnected: ' . $e->getMessage());
+            return true;
+        }
+        return false;
     }
 
     private function setStatus(string $msg): void
@@ -1620,6 +1699,9 @@ class App
             case 'r':
                 $this->readDetailSelected();
                 break;
+            case 'w':
+                $this->writeValueDialog();
+                break;
             case 'RESIZE':
                 [$this->cols, $this->rows] = termSize();
                 break;
@@ -1632,6 +1714,209 @@ class App
         if (isset($items[$this->cursor])) {
             $this->readDetail($items[$this->cursor]['uuid']);
         }
+    }
+
+    /**
+     * Show a write-value dialog overlay for the currently selected element.
+     * Writes to attribute ID 11 (value). The user types a value and presses
+     * Enter to send, or Escape to cancel.
+     *
+     * Value parsing:
+     *   "true"/"false" → bool, integer strings → int, decimal strings → float,
+     *   anything else → string
+     */
+    private function writeValueDialog(): void
+    {
+        $items = $this->currentLevel();
+        $sel = $items[$this->cursor] ?? null;
+        if (!$sel) {
+            $this->setStatus('No element selected.');
+            return;
+        }
+
+        // Only allow write if the element has a value attribute loaded
+        if (empty($this->detail) || !isset($this->detail[11])) {
+            $this->setStatus('No writable value attribute on this element. Select a data point first.');
+            return;
+        }
+
+        $uuid = $sel['uuid'];
+        $name = $sel['key'];
+        if (str_contains($name, '.')) {
+            $name = substr($name, strrpos($name, '.') + 1);
+        }
+
+        // Get current value for display
+        $currentVal = '';
+        if (isset($this->detail[11])) {
+            $v = $this->detail[11];
+            if ($v instanceof CborTag && $v->tag === 121) $v = $v->value;
+            $currentVal = formatValue($v);
+        }
+
+        // Draw the write dialog overlay
+        [$this->cols, $this->rows] = termSize();
+        $boxW = min(60, $this->cols - 4);
+        $boxH = 11;
+        $startCol = max(1, (int)(($this->cols - $boxW) / 2));
+        $startRow = max(1, (int)(($this->rows - $boxH) / 2));
+        $inner = $boxW - 4;
+
+        $input = '';
+        $error = '';
+
+        // Enable cursor for text input
+        showCursor();
+
+        while (true) {
+            // Draw box
+            drawBox($startRow, $startCol, $boxW, $boxH, 'Write Value', YELLOW . BOLD);
+
+            // Clear inner area
+            for ($i = 0; $i < $boxH - 2; $i++) {
+                moveTo($startRow + 1 + $i, $startCol + 2);
+                echo str_repeat(' ', $inner);
+            }
+
+            $r = $startRow + 1;
+
+            // Element name
+            moveTo($r, $startCol + 2);
+            echo FG_LABEL . 'Element: ' . RESET . WHITE . BOLD . $name . RESET;
+            $r++;
+
+            // Current value
+            moveTo($r, $startCol + 2);
+            echo FG_LABEL . 'Current: ' . RESET . FG_LIVE . ($currentVal !== '' ? $currentVal : GRAY . ITALIC . 'n/a') . RESET;
+            $r++;
+
+            // Separator
+            moveTo($r, $startCol + 2);
+            echo FG_BOX . str_repeat('─', $inner) . RESET;
+            $r++;
+
+            // Input prompt
+            moveTo($r, $startCol + 2);
+            echo WHITE . BOLD . 'New value: ' . RESET . CYAN . $input . RESET;
+            // Clear rest of line after input
+            $inputVisLen = 11 + mb_strlen($input);
+            echo str_repeat(' ', max(0, $inner - $inputVisLen));
+            $r++;
+
+            // Error message (if any)
+            moveTo($r, $startCol + 2);
+            if ($error !== '') {
+                echo RED . $error . RESET;
+                echo str_repeat(' ', max(0, $inner - mb_strlen(preg_replace('/\033\[[0-9;]*m/', '', $error))));
+            } else {
+                echo str_repeat(' ', $inner);
+            }
+            $r += 2;
+
+            // Key hints
+            moveTo($r, $startCol + 2);
+            echo BOLD . WHITE . '↵' . RESET . GRAY . ' send    '
+               . BOLD . WHITE . 'Esc' . RESET . GRAY . ' cancel' . RESET;
+
+            // Position cursor at end of input
+            moveTo($startRow + 4, $startCol + 2 + 11 + mb_strlen($input));
+
+            // Read a keypress (blocking on STDIN only)
+            $reads = [STDIN];
+            $w = null;
+            $e = null;
+            $ready = @stream_select($reads, $w, $e, 0, 200000);
+
+            // Keep draining WebSocket to stay alive
+            try {
+                $this->ws->drainFrames();
+            } catch (\Throwable $ex) {
+                $this->disconnected = true;
+                $this->subscriptionId = '';
+                hideCursor();
+                return;
+            }
+
+            if ($ready === false || $ready === 0) continue;
+            if (!in_array(STDIN, $reads, true)) continue;
+
+            stream_set_blocking(STDIN, false);
+            $c = fread(STDIN, 1);
+            if ($c === false || $c === '') { stream_set_blocking(STDIN, true); continue; }
+
+            // Escape key → cancel
+            if ($c === "\033") {
+                $seq = fread(STDIN, 6);
+                stream_set_blocking(STDIN, true);
+                if ($seq === '' || $seq === false) {
+                    // Plain Escape pressed
+                    hideCursor();
+                    $this->setStatus('Write cancelled.');
+                    return;
+                }
+                // Ignore arrow keys etc. inside the dialog
+                continue;
+            }
+            stream_set_blocking(STDIN, true);
+
+            // Enter → submit
+            if ($c === "\n" || $c === "\r") {
+                if ($input === '') {
+                    $error = 'Value cannot be empty.';
+                    continue;
+                }
+                // Parse the input value
+                $writeVal = $this->parseWriteValue($input);
+
+                hideCursor();
+                try {
+                    $this->api->write($uuid, 11, $writeVal);
+                    $this->setStatus("Value written: {$input}");
+                    // Refresh detail to see updated value
+                    $this->readDetail($uuid);
+                } catch (\Throwable $ex) {
+                    if ($this->detectDisconnect($ex)) return;
+                    $this->setStatus('Write failed: ' . $ex->getMessage());
+                }
+                return;
+            }
+
+            // Backspace → delete last character
+            if ($c === "\x7f" || $c === "\x08") {
+                if ($input !== '') {
+                    $input = mb_substr($input, 0, -1);
+                }
+                $error = '';
+                continue;
+            }
+
+            // Printable characters → append to input
+            if (ord($c) >= 32 && ord($c) < 127) {
+                $input .= $c;
+                $error = '';
+            }
+        }
+    }
+
+    /**
+     * Parse a user-typed string into the appropriate PHP type for CBOR encoding.
+     *   "true"/"false"  → bool
+     *   Integer string   → int
+     *   Decimal string   → float
+     *   Anything else    → string
+     */
+    private function parseWriteValue(string $input): mixed
+    {
+        $lower = strtolower(trim($input));
+        if ($lower === 'true') return true;
+        if ($lower === 'false') return false;
+        if ($lower === 'null') return null;
+        // Integer (no decimal point)
+        if (preg_match('/^-?\d+$/', $input)) return (int)$input;
+        // Float
+        if (is_numeric($input)) return (float)$input;
+        // String
+        return $input;
     }
 
     private function draw(): void
@@ -1772,12 +2057,135 @@ class App
               . BOLD . WHITE . '↵' . RESET . BG_STATUS . GRAY . ' enter  '
               . BOLD . WHITE . '⌫' . RESET . BG_STATUS . GRAY . ' back  '
               . BOLD . WHITE . 'r' . RESET . BG_STATUS . GRAY . ' read  '
+              . BOLD . WHITE . 'w' . RESET . BG_STATUS . GRAY . ' write  '
               . BOLD . WHITE . 'q' . RESET . BG_STATUS . GRAY . ' quit';
         $status = mb_substr($this->status, 0, (int)($this->cols / 2));
         echo BG_STATUS . FG_LIVE . ' ' . $status . RESET . BG_STATUS;
         $visStatus = mb_strlen($status) + 1;
-        echo str_repeat(' ', max(0, $this->cols - $visStatus - 42));
+        echo str_repeat(' ', max(0, $this->cols - $visStatus - 51));
         echo $keys . ' ' . RESET;
+    }
+
+    /**
+     * Attempt to reconnect to Xentara after a connection loss.
+     * Re-establishes the WebSocket connection, sends Client Hello,
+     * re-browses the current navigation path, and re-subscribes
+     * to the previously selected element's live attributes.
+     */
+    private function reconnect(): void
+    {
+        $this->setStatus('Reconnecting...');
+        $this->drawDisconnectedOverlay('Reconnecting...');
+
+        try {
+            $this->ws->disconnect();
+            $this->ws->connect($this->connHost, $this->connPort, $this->connUser, $this->connPass);
+            $this->api->clientHello();
+        } catch (\Throwable $e) {
+            $this->setStatus('Reconnect failed: ' . $e->getMessage());
+            return; // stay in disconnected state
+        }
+
+        // Connection restored
+        $this->disconnected = false;
+        $this->subscriptionId = '';
+
+        // Re-browse the current navigation path from root
+        $uuids = array_column($this->navStack, 'uuid');
+        $names = array_column($this->navStack, 'name');
+        $this->navStack = [];
+
+        foreach ($uuids as $i => $uuid) {
+            try {
+                $items = $this->browseLevel($uuid);
+                $this->navStack[] = ['uuid' => $uuid, 'name' => $names[$i], 'items' => $items];
+            } catch (\Throwable $e) {
+                // If re-browse fails partway, stop at the last successful level
+                break;
+            }
+        }
+
+        // If nothing could be browsed, fall back to root
+        if (empty($this->navStack)) {
+            $items = $this->browseLevel(NIL_UUID);
+            $this->navStack[] = ['uuid' => NIL_UUID, 'name' => 'Xentara Root', 'items' => $items];
+            $this->cursor = 0;
+            $this->scroll = 0;
+        }
+
+        // Clamp cursor to current level
+        $count = count($this->currentLevel());
+        if ($this->cursor >= $count) $this->cursor = max(0, $count - 1);
+
+        // Re-read detail and re-subscribe for the selected element
+        $this->detail = [];
+        $this->detailUuid = '';
+        $this->readDetailSelected();
+
+        $this->setStatus('Reconnected successfully.');
+    }
+
+    /**
+     * Draw a centered overlay box showing the disconnected state.
+     * Displayed on top of the existing TUI when the connection is lost.
+     */
+    private function drawDisconnectedOverlay(string $message = ''): void
+    {
+        [$this->cols, $this->rows] = termSize();
+        $boxW = 52;
+        $boxH = 9;
+        $startCol = max(1, (int)(($this->cols - $boxW) / 2));
+        $startRow = max(1, (int)(($this->rows - $boxH) / 2));
+
+        // Box border
+        drawBox($startRow, $startCol, $boxW, $boxH, 'Connection Lost', RED . BOLD);
+
+        $inner = $boxW - 4;
+        $r = $startRow + 1;
+
+        // Blank inner rows
+        for ($i = 0; $i < $boxH - 2; $i++) {
+            moveTo($startRow + 1 + $i, $startCol + 2);
+            echo str_repeat(' ', $inner);
+        }
+
+        if ($message !== '') {
+            moveTo($r + 1, $startCol + 2);
+            $vis = mb_strlen(preg_replace('/\033\[[0-9;]*m/', '', $message));
+            $pad = max(0, (int)(($inner - $vis) / 2));
+            echo str_repeat(' ', $pad) . YELLOW . BOLD . $message . RESET;
+        } else {
+            moveTo($r, $startCol + 2);
+            echo RED . BOLD . '  ✗ ' . RESET . WHITE . 'Xentara connection was lost.' . RESET;
+
+            moveTo($r + 2, $startCol + 2);
+            echo GRAY . '  The Xentara instance may have stopped.' . RESET;
+            moveTo($r + 3, $startCol + 2);
+            echo GRAY . '  Restart Xentara, then press ' . WHITE . BOLD . 'c' . RESET . GRAY . ' to reconnect.' . RESET;
+
+            moveTo($r + 5, $startCol + 2);
+            echo BOLD . WHITE . '  c' . RESET . GRAY . ' reconnect    ' . BOLD . WHITE . 'q' . RESET . GRAY . ' quit' . RESET;
+        }
+    }
+
+    /**
+     * Minimal key reader for the disconnected state.
+     * Only listens to STDIN (no WebSocket), waits up to 500ms.
+     */
+    private function readKeyDisconnected(): ?string
+    {
+        $reads = [STDIN];
+        $w = null;
+        $e = null;
+        $ready = @stream_select($reads, $w, $e, 0, 500000);
+        if ($ready === false || $ready === 0) return null;
+        if (!in_array(STDIN, $reads, true)) return null;
+
+        stream_set_blocking(STDIN, false);
+        $c = fread(STDIN, 1);
+        stream_set_blocking(STDIN, true);
+        if ($c === false || $c === '') return null;
+        return $c;
     }
 
     /** Redraw only the attribute values in the right pane (no full redraw) */
@@ -1838,7 +2246,11 @@ class App
         try {
             $this->ws->drainFrames();
         } catch (\Throwable $ex) {
-            $this->setStatus('Connection error: ' . $ex->getMessage());
+            // Connection lost — enter disconnected state
+            $this->disconnected = true;
+            $this->subscriptionId = '';
+            $this->setStatus('Disconnected: ' . $ex->getMessage());
+            return null;
         }
 
         if ($ready === false || $ready === 0) return null;
@@ -1870,6 +2282,16 @@ class App
 // 3. Run the interactive TUI loop
 // 4. Disconnect cleanly on exit
 
+// ASCII art banner
+echo CYAN . BOLD . "
+  ██╗  ██╗███████╗███╗   ██╗████████╗ █████╗ ██████╗  █████╗
+  ╚██╗██╔╝██╔════╝████╗  ██║╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗
+   ╚███╔╝ █████╗  ██╔██╗ ██║   ██║   ███████║██████╔╝███████║
+   ██╔██╗ ██╔══╝  ██║╚██╗██║   ██║   ██╔══██║██╔══██╗██╔══██║
+  ██╔╝ ██╗███████╗██║ ╚████║   ██║   ██║  ██║██║  ██║██║  ██║
+  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝
+" . RESET . GRAY . "  Terminal User Interface" . RESET . "\n\n";
+
 echo CYAN . "Connecting to wss://{$host}:{$port} as {$user}..." . RESET . "\n";
 
 $ws  = new XentaraWsClient();
@@ -1890,7 +2312,7 @@ try {
 echo GREEN . "Connected!" . RESET . "\n";
 
 $api = new XentaraApi($ws);
-$app = new App($api, $ws);
+$app = new App($api, $ws, $host, $port, $user, $pass);
 
 try {
     $app->run();

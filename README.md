@@ -17,6 +17,8 @@ A terminal user interface for browsing and monitoring the [Xentara](https://www.
 - **Zero Dependencies** — Pure PHP, no Composer packages or external libraries required
 - **Credential Persistence** — First-run setup wizard saves config to `~/.config/xentara-tui/config.json`
 - **Flicker-Free Rendering** — Partial redraws and cursor-home technique for smooth updates
+- **Auto-Reconnect** — If Xentara stops, press `c` to reconnect without losing your TUI session
+- **Write Values** — Write to writable attributes (e.g. Registers) directly from the TUI with `w`
 
 ## Screenshots
 
@@ -50,6 +52,8 @@ A terminal user interface for browsing and monitoring the [Xentara](https://www.
 | **ext-mbstring**  | —         | Unicode text handling in the TUI          |
 | **Terminal**      | VT100+    | Any modern terminal (gnome-terminal, kitty, alacritty, Windows Terminal) |
 | **Xentara**       | 2.0+      | Running with WebSocket API enabled       |
+
+> **Important:** Xentara must be running on the target machine for the WebSocket connection to succeed. If Xentara is installed but not started, open a terminal on that machine and run `xentara` to start it. If the Xentara process is stopped while the TUI is open, the TUI will detect the disconnection and let you press `c` to reconnect once Xentara is running again.
 
 ### Checking Requirements
 
@@ -213,6 +217,8 @@ xentara-tui --debug
 | `Enter`      | Drill into selected element (browse children)    |
 | `Backspace`  | Go back up one level                             |
 | `r`          | Read/refresh attributes for the selected element |
+| `w`          | Write a value to the selected element's attribute |
+| `c`          | Reconnect to Xentara after a connection loss     |
 | `q`          | Quit the application                             |
 
 ---
@@ -339,7 +345,8 @@ WebSocket upgrade failed: HTTP/1.1 401 Unauthorized
 
 ### Broken Pipe / Connection Drops
 
-- Usually caused by missed ping/pong frames — this client handles them automatically
+- If Xentara is stopped or restarted, the TUI will show a **Connection Lost** overlay
+- Press `c` to reconnect — the TUI will restore your navigation position automatically
 - If running through a proxy, ensure WebSocket connections aren't being terminated
 - Enable debug mode to see raw traffic: `xentara-tui --debug`
 
