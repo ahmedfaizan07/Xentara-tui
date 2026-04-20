@@ -3,7 +3,7 @@
 A terminal user interface for browsing and monitoring the [Xentara](https://www.xentara.io/) model tree in real time via the Xentara WebSocket API.
 
 ![PHP 8.1+](https://img.shields.io/badge/PHP-8.1%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/gnu)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
 ---
@@ -25,7 +25,7 @@ A terminal user interface for browsing and monitoring the [Xentara](https://www.
  ┌─ Model Tree ────────────────┐┌─ Element Detail ────────────────────────┐
  │ ⚙ myDevice                  ││ ⚙ myDevice.temperatures.sensor1        │
  │ ⚙ anotherDevice             ││ ─────────────────────────────────────── │
- │ ◆ sensor1               ◀  ││ UUID      550e8400-e29b-41d4-a716-4466 │
+ │ ◆ sensor1              ◀   ││ UUID      550e8400-e29b-41d4-a716-4466 │
  │ ◆ sensor2                   ││ Category  Data Point                    │
  │ ⏱ updateTimer                ││                                        │
  │                              ││ ▸ Attributes ●                         │
@@ -209,7 +209,7 @@ xentara-tui --debug
 
 | Key          | Action                                           |
 |--------------|--------------------------------------------------|
-| `↑` / `↓`   | Move cursor up/down in the model tree            |
+| `↑` / `↓`    | Move cursor up/down in the model tree            |
 | `Enter`      | Drill into selected element (browse children)    |
 | `Backspace`  | Go back up one level                             |
 | `r`          | Read/refresh attributes for the selected element |
@@ -242,10 +242,10 @@ To change stored credentials, either:
 ### Architecture
 
 ```
-┌──────────────┐     CBOR/WSS      ┌────────────┐
+┌──────────────┐     CBOR/WSS        ┌────────────┐
 │  Xentara TUI │ ◀────────────────▶ │  Xentara   │
-│  (PHP CLI)   │   WebSocket API    │  Server    │
-└──────┬───────┘                    └────────────┘
+│  (PHP CLI)   │   WebSocket API     │  Server    │
+└──────┬───────┘                     └────────────┘
        │
        ├── Cbor class          CBOR encoder/decoder (RFC 8949)
        ├── XentaraWsClient     WebSocket client with TLS, ping/pong, framing

@@ -534,7 +534,55 @@ class XentaraWsClient
      */
     public function connect(string $host, int $port, string $user, string $pass): void
     {
-        // Allow self-signed certificates (common in local Xentara deployments)
+        // ── Step 1: DNS resolution ────────────────────────────────────────
+        $this->emitStatus('Resolving hostname...');
+        $ip = @gethostbyname($host);
+        if ($ip === $host && !filter_var($host, FILTER_VALIDATE_IP)) {
+            throw new \RuntimeException(
+                "DNS resolution failed: cannot resolve '{$host}'\n"
+                . "  \033[33m→ Check that the hostname is correct\n"
+                . "  → Verify your DNS settings or try using an IP address instead\033[0m"
+            );
+        }
+        $this->emitStatus("Resolved {$host} → {$ip}");
+
+        // ── Step 2: TCP port reachability (plain socket, no SSL) ──────────
+        $this->emitStatus("Checking port {$port} on {$ip}...");
+        $tcpTest = @stream_socket_client(
+            "tcp://{$ip}:{$port}", $tcpErrno, $tcpErrstr, 5,
+            STREAM_CLIENT_CONNECT
+        );
+        if ($tcpTest === false) {
+            $hint = match (true) {
+                $tcpErrno === 110, $tcpErrno === 10060,
+                str_contains(strtolower($tcpErrstr), 'timed out') =>
+                    "Connection timed out — port {$port} is likely blocked by a firewall\n"
+                    . "  \033[33m→ Check that port {$port} is open on the target system (e.g. sudo ufw allow {$port}/tcp)\n"
+                    . "  → Verify you are on the same network or VPN as {$host}\n"
+                    . "  → Check if Xentara's WebSocket API uses a different port\033[0m",
+                $tcpErrno === 111, $tcpErrno === 10061,
+                str_contains(strtolower($tcpErrstr), 'refused') =>
+                    "Connection refused — port {$port} is reachable but nothing is listening\n"
+                    . "  \033[33m→ Verify that Xentara is running on {$host}\n"
+                    . "  → Check that the WebSocket API is enabled and bound to port {$port}\n"
+                    . "  → Try: nc -zv {$host} {$port}\033[0m",
+                $tcpErrno === 113, $tcpErrno === 10065,
+                str_contains(strtolower($tcpErrstr), 'no route') =>
+                    "No route to host — the network path to {$host} does not exist\n"
+                    . "  \033[33m→ Check your network connection and routing\n"
+                    . "  → If {$host} is on a private network, ensure VPN is connected\033[0m",
+                default =>
+                    "TCP connect failed: {$tcpErrstr} (errno {$tcpErrno})\n"
+                    . "  \033[33m→ Try: nc -zv {$host} {$port}\n"
+                    . "  → Check firewall rules on both client and server\033[0m",
+            };
+            throw new \RuntimeException($hint);
+        }
+        fclose($tcpTest);
+        $this->emitStatus("Port {$port} is open");
+
+        // ── Step 3: SSL/TLS handshake ─────────────────────────────────────
+        $this->emitStatus('Establishing SSL/TLS connection...');
         $ctx = stream_context_create([
             'ssl' => [
                 'verify_peer'       => false,
@@ -544,14 +592,28 @@ class XentaraWsClient
         ]);
 
         $uri    = "ssl://{$host}:{$port}";
-        $socket = stream_socket_client($uri, $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $ctx);
+        $socket = @stream_socket_client($uri, $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $ctx);
         if ($socket === false) {
-            throw new \RuntimeException("TCP connect failed: {$errstr} ({$errno})");
+            $hint = match (true) {
+                str_contains(strtolower($errstr), 'ssl') ||
+                str_contains(strtolower($errstr), 'tls') =>
+                    "SSL/TLS handshake failed: {$errstr}\n"
+                    . "  \033[33m→ The port is open but may not be serving SSL/TLS\n"
+                    . "  → Check if Xentara is configured for HTTPS on port {$port}\n"
+                    . "  → Try: openssl s_client -connect {$host}:{$port}\033[0m",
+                default =>
+                    "SSL connection failed: {$errstr} (errno {$errno})\n"
+                    . "  \033[33m→ TCP port is open but SSL setup failed\n"
+                    . "  → Try: openssl s_client -connect {$host}:{$port}\033[0m",
+            };
+            throw new \RuntimeException($hint);
         }
         stream_set_blocking($socket, true);
         $this->socket = $socket;
+        $this->emitStatus('SSL/TLS established');
 
-        // HTTP upgrade handshake
+        // ── Step 4: WebSocket HTTP upgrade handshake ──────────────────────
+        $this->emitStatus('WebSocket handshake...');
         $key    = base64_encode(random_bytes(16));
         $auth   = base64_encode("{$user}:{$pass}");
         $req    = "GET /api/ws HTTP/1.1\r\n"
@@ -576,10 +638,43 @@ class XentaraWsClient
             fclose($this->socket);
             $this->socket = null;
             $status = strtok($response, "\r\n");
-            throw new \RuntimeException("WebSocket upgrade failed: {$status}");
+            $hint = match (true) {
+                str_contains($response, '401') || str_contains($response, 'Unauthorized') =>
+                    "Authentication failed (HTTP 401)\n"
+                    . "  \033[33m→ Check username and password\n"
+                    . "  → Run with --reset-config to re-enter credentials\033[0m",
+                str_contains($response, '403') || str_contains($response, 'Forbidden') =>
+                    "Access forbidden (HTTP 403)\n"
+                    . "  \033[33m→ User '{$user}' may not have permission to access the WebSocket API\n"
+                    . "  → Check Xentara user roles and permissions\033[0m",
+                str_contains($response, '404') =>
+                    "WebSocket endpoint not found (HTTP 404)\n"
+                    . "  \033[33m→ The server is responding but /api/ws was not found\n"
+                    . "  → Verify the Xentara WebSocket API is enabled\n"
+                    . "  → Check if the API path has changed in your Xentara version\033[0m",
+                $response === '' =>
+                    "Server closed connection without responding\n"
+                    . "  \033[33m→ The server may not support WebSocket on this port\n"
+                    . "  → Try a different port or check Xentara configuration\033[0m",
+                default =>
+                    "WebSocket upgrade failed: {$status}\n"
+                    . "  \033[33m→ Server responded but did not accept the WebSocket upgrade\033[0m",
+            };
+            throw new \RuntimeException($hint);
         }
 
         stream_set_blocking($this->socket, false);
+        $this->emitStatus('WebSocket connected');
+    }
+
+    /** Emit a status message during connection (callable set externally) */
+    private ?\Closure $statusCallback = null;
+
+    public function onStatus(\Closure $cb): void { $this->statusCallback = $cb; }
+
+    private function emitStatus(string $msg): void
+    {
+        if ($this->statusCallback) ($this->statusCallback)($msg);
     }
 
     public function disconnect(): void
@@ -1779,10 +1874,16 @@ echo CYAN . "Connecting to wss://{$host}:{$port} as {$user}..." . RESET . "\n";
 
 $ws  = new XentaraWsClient();
 $ws->setDebug($debug);
+
+// Show step-by-step connection progress
+$ws->onStatus(function (string $msg) {
+    echo GRAY . "  ▸ " . $msg . RESET . "\n";
+});
+
 try {
     $ws->connect($host, $port, $user, $pass);
 } catch (\Throwable $e) {
-    echo RED . "Connection failed: " . $e->getMessage() . RESET . "\n";
+    echo RED . "\n✗ Connection failed:\n  " . $e->getMessage() . RESET . "\n";
     exit(1);
 }
 
