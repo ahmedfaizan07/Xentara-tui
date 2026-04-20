@@ -3,7 +3,7 @@
 A terminal user interface for browsing and monitoring the [Xentara](https://www.xentara.io/) model tree in real time via the Xentara WebSocket API.
 
 ![PHP 8.1+](https://img.shields.io/badge/PHP-8.1%2B-blue)
-![License](https://img.shields.io/badge/gnu)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
 ---
